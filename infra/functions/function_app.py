@@ -1516,10 +1516,12 @@ def upload_file(req: func.HttpRequest) -> func.HttpResponse:
 def import_platform_file(req: func.HttpRequest) -> func.HttpResponse:
     """
     Copy a file from the platform's shared competition file pool into this
-    tool's competition folder. Query: competition (this tool's competition id)
-    and name (pool blob file name). The pool path is composed server-side from
-    the competition's bound PlatformId, so a client can never point this at
-    another competition's files.
+    tool's competition folder. Query: competition (this tool's competition id),
+    name (pool blob file name) and the optional source — "upload" (the default,
+    files people uploaded) or "fsm" (files the HOVTP listener pushed). The pool
+    path is composed server-side from the competition's bound PlatformId and
+    the source's fixed folder name, so a client can never point this at another
+    competition's files.
     """
     logging.info('Importing file from the platform file pool...')
 
@@ -1532,6 +1534,12 @@ def import_platform_file(req: func.HttpRequest) -> func.HttpResponse:
 
     if not competition or not name:
         return func.HttpResponse("Missing competition or name", status_code=400)
+
+    # The pool has two folders; the client picks one by name, never by path.
+    source = req.params.get('source') or 'upload'
+    if source not in ('upload', 'fsm'):
+        return func.HttpResponse(
+            "invalid_source: source must be 'upload' or 'fsm'", status_code=400)
 
     # Sanitize: only the basename is ever used, both for the pool lookup and
     # for the destination blob path.
@@ -1569,7 +1577,7 @@ def import_platform_file(req: func.HttpRequest) -> func.HttpResponse:
             "platform_not_configured: the platform file pool is not configured",
             status_code=503)
 
-    pool_path = f"{platform_id}/uploads/{filename}"
+    pool_path = f"{platform_id}/{'fsm' if source == 'fsm' else 'uploads'}/{filename}"
 
     try:
         source_blob = pool_container.get_blob_client(pool_path)
