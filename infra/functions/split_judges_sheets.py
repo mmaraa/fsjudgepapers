@@ -88,6 +88,118 @@ def extract_starting_number(page_text):
     return None, None
 
 
+# A header line marking a withdrawn skater: 'WD' followed by the name.
+# The negative lookahead skips the 'WD  Withdrawn' legend that start lists
+# and similar summary pages carry.
+WITHDRAWN_HEADER_RE = re.compile(r'^WD\s+(?!Withdrawn\b)\S')
+
+# How many non-empty lines from the top of a page count as the FSM header block.
+WITHDRAWN_HEADER_LINES = 8
+
+
+def _withdrawn_header_line(page_text):
+    """
+    Return the header line marking this page as a withdrawn skater's, or None.
+
+    Only the first few non-empty lines (the FSM header block) are scanned: the
+    element rows further down never look like 'WD <name>', but a skater name
+    can appear lower on some tables (e.g. a per-segment list), and those pages
+    must not be treated as a single withdrawn skater's page.
+    """
+    seen = 0
+    for line in page_text.split('\n'):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if WITHDRAWN_HEADER_RE.match(stripped):
+            return stripped
+        seen += 1
+        if seen >= WITHDRAWN_HEADER_LINES:
+            break
+    return None
+
+
+def _is_withdrawn_legend(name):
+    """True for the 'WD  Withdrawn' legend line's second column."""
+    return bool(name) and bool(re.match(r'^Withdrawn\b', name.strip()))
+
+
+def is_withdrawn_page(page_text):
+    """
+    True if this page belongs to a single withdrawn skater.
+
+    FSM prints 'WD' where the starting number would be, in two column styles:
+    the JudgesSheetAll pages separate the columns with 2+ spaces
+    ('WD    Ines SALMINEN    HTA'), while the Technical Controller / Specialist
+    sheets use a single space ('WD Ines SALMINEN     HTA') — which is why
+    extract_starting_number (2+ space columns) alone is not enough. Both styles
+    are covered: the header-block scan handles the single-space layout and
+    extract_starting_number handles the wide-column one.
+    """
+    if _withdrawn_header_line(page_text):
+        return True
+    starting_num, competitor_name = extract_starting_number(page_text)
+    # 'WD  Withdrawn' is the legend of a start list / planned program content
+    # page, not a withdrawn skater's own page.
+    return starting_num == 'WD' and not _is_withdrawn_legend(competitor_name)
+
+
+def withdrawn_name_from_page(page_text):
+    """
+    Competitor name from a withdrawn skater's page, or None.
+
+    Used for the cover page's "Withdrawn:" list.
+    """
+    starting_num, competitor_name = extract_starting_number(page_text)
+    if starting_num == 'WD' and competitor_name and not _is_withdrawn_legend(competitor_name):
+        return competitor_name
+
+    line = _withdrawn_header_line(page_text)
+    if not line:
+        return None
+
+    rest = re.sub(r'^WD\s+', '', line).strip()
+    if not rest:
+        return None
+    # Drop the trailing club column (separated by 2+ spaces)
+    return re.split(r'\s{2,}', rest)[0].strip() or None
+
+
+def filter_withdrawn_pages(input_pdf, output_pdf):
+    """
+    Copy input_pdf to output_pdf without the pages of withdrawn skaters.
+
+    Used for the per-skater Technical Controller / Technical Specialist sheets,
+    which are merged into the packets whole. Pages whose text cannot be read
+    are kept. Returns the number of pages removed (0 if input_pdf is missing,
+    in which case nothing is written).
+    """
+    if not os.path.exists(input_pdf):
+        return 0
+
+    reader = PdfReader(input_pdf)
+    writer = PdfWriter()
+    removed = 0
+
+    for i, page in enumerate(reader.pages):
+        try:
+            text = page.extract_text(extraction_mode="layout")
+        except Exception as e:
+            print(f"  Warning: Could not read page {i+1} of {os.path.basename(input_pdf)}: {e}")
+            text = None
+
+        if text and is_withdrawn_page(text):
+            removed += 1
+            continue
+
+        writer.add_page(page)
+
+    with open(output_pdf, "wb") as f:
+        writer.write(f)
+
+    return removed
+
+
 def split_pdf(pdf_path):
     """
     Split a JudgesSheetAll PDF into per-judge/referee PDFs.
@@ -114,10 +226,11 @@ def split_pdf(pdf_path):
         
         # Check if this page is for a withdrawn competitor
         starting_num, competitor_name = extract_starting_number(text)
-        if starting_num == 'WD':
-            if competitor_name and competitor_name not in withdrawn_competitors:
-                withdrawn_competitors.append(competitor_name)
-            print(f"  Skipping page {i+1}: Withdrawn competitor '{competitor_name}'")
+        if starting_num == 'WD' or is_withdrawn_page(text):
+            name = withdrawn_name_from_page(text) or competitor_name
+            if name and name not in withdrawn_competitors:
+                withdrawn_competitors.append(name)
+            print(f"  Skipping page {i+1}: Withdrawn competitor '{name}'")
             continue  # Skip this page entirely
         
         found_judge_on_page = False

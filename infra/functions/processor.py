@@ -6,14 +6,14 @@ from datetime import datetime
 
 # Import functions from existing scripts
 try:
-    from .split_judges_sheets import split_pdf
+    from .split_judges_sheets import split_pdf, filter_withdrawn_pages
     from .create_cover_pages import create_cover_pdf, create_segment_cover_pdf, create_start_list_with_strikethrough, extract_title_from_pdf, extract_segment_name_from_pdf
     from .combine_judging_papers import get_date_from_start_list, get_first_start_time_from_start_list, get_panel_info, merge_pdfs, slugify
     from .categories import load_categories, match_category, parse_filename_generic
     from .competition_schedule import parse_competition_schedule, get_schedule_start_time
 except ImportError:
     # Fallback for local testing if not running as package
-    from split_judges_sheets import split_pdf
+    from split_judges_sheets import split_pdf, filter_withdrawn_pages
     from create_cover_pages import create_cover_pdf, create_segment_cover_pdf, create_start_list_with_strikethrough, extract_title_from_pdf, extract_segment_name_from_pdf
     from combine_judging_papers import get_date_from_start_list, get_first_start_time_from_start_list, get_panel_info, merge_pdfs, slugify
     from categories import load_categories, match_category, parse_filename_generic
@@ -319,6 +319,29 @@ def process_judging_papers(source_dir, output_dir, options=None):
     
     count = 0
     total_pages = 0  # pages across per-person packets (for usage statistics)
+    withdrawn_pages_removed = 0  # pages dropped from the per-skater official sheets
+
+    def sheet_without_withdrawn(base_path, suffix):
+        """
+        Path to a per-skater official sheet (Technical Controller / Specialist)
+        with the withdrawn skaters' pages removed. The filtered copy is written
+        once per segment and reused by every official on it (the person loop
+        runs once per official per segment). Returns the original path when the
+        sheet is missing, so merge_pdfs still warns about it.
+        """
+        nonlocal withdrawn_pages_removed
+        src = f"{base_path}_{suffix}.pdf"
+        if not os.path.exists(src):
+            return src
+
+        dst = f"{base_path}_{suffix}_nowd.pdf"
+        if not os.path.exists(dst):
+            removed = filter_withdrawn_pages(src, dst)
+            if removed:
+                print(f"  Removed {removed} withdrawn page(s) from {os.path.basename(src)}")
+                withdrawn_pages_removed += removed
+        return dst
+
     for date_str, persons in person_tasks.items():
         for slug, data in persons.items():
             tasks = data['tasks']
@@ -461,13 +484,13 @@ def process_judging_papers(source_dir, output_dir, options=None):
                     file_list.append(f"{base_path}_JudgesSheetAll_judge_{slug}.pdf")
                     
                 elif role == "technical_controller":
-                    file_list.append(f"{base_path}_TechnicalControllerSheet.pdf")
+                    file_list.append(sheet_without_withdrawn(base_path, "TechnicalControllerSheet"))
                     
                 elif role == "technical_specialist_1":
-                    file_list.append(f"{base_path}_TechnicalSpecialistSheet1.pdf")
+                    file_list.append(sheet_without_withdrawn(base_path, "TechnicalSpecialistSheet1"))
                     
                 elif role == "technical_specialist_2":
-                    file_list.append(f"{base_path}_TechnicalSpecialistSheet2.pdf")
+                    file_list.append(sheet_without_withdrawn(base_path, "TechnicalSpecialistSheet2"))
                     
                 elif role in ["data_operator", "replay_operator"]:
                     file_list.append(f"{base_path}_PlannedProgramContent.pdf")
@@ -539,7 +562,7 @@ def process_judging_papers(source_dir, output_dir, options=None):
     try:
         stats = _compute_statistics(
             categories, schedule_entries, person_tasks, prefix_withdrawn,
-            language, total_pages
+            language, total_pages, withdrawn_pages_removed
         )
     except Exception as e:
         print(f"  Warning: Failed to compute statistics: {e}")
@@ -549,7 +572,7 @@ def process_judging_papers(source_dir, output_dir, options=None):
 
 
 def _compute_statistics(categories, schedule_entries, person_tasks, prefix_withdrawn,
-                        language, total_pages):
+                        language, total_pages, withdrawn_pages_removed=0):
     """
     Build a usage-statistics dict from the structures accumulated during
     process_judging_papers. Stored on the competitions table row (which
@@ -641,6 +664,7 @@ def _compute_statistics(categories, schedule_entries, person_tasks, prefix_withd
         "unique_official_count": len(all_slugs),
         "officials_by_role": officials_by_role,
         "withdrawn_count": withdrawn_count,
+        "withdrawn_pages_removed": withdrawn_pages_removed,
         "day_count": len(dates),
         "first_date": _iso_date(dates[0]) if dates else None,
         "last_date": _iso_date(dates[-1]) if dates else None,
