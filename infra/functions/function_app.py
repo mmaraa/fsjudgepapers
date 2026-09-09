@@ -25,6 +25,11 @@ app = func.FunctionApp(http_auth_level=func.AuthLevel.ANONYMOUS)
 # Maximum file upload size: 25 MB
 MAX_UPLOAD_SIZE = 25 * 1024 * 1024
 
+# Platform competition GUIDs (the PlatformId binding) always look like this.
+# Pinned before being spliced into a pool blob path — the binding originates
+# from a client body (resolve_competition).
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+
 # Automatic competition deletion: lifetime after creation, extension per
 # "extend" click, and the fixed migration date for rows created before this
 # feature existed (rows missing DeletionDate).
@@ -194,6 +199,128 @@ def get_platform_container_client():
     return client.get_container_client(container_name)
 
 
+class _PoolFileTooLarge(ValueError):
+    """Pool blob exceeds MAX_UPLOAD_SIZE — the import route maps it to 413."""
+
+
+class _PoolReadError(Exception):
+    """Reading a pool blob failed — the import route maps it to 502."""
+
+
+def _copy_pool_blob(pool_container, pool_path, container, blob_path, metadata):
+    """
+    Copy one blob out of the platform file pool into this tool's container,
+    stamping provenance metadata (poolSource / poolUploadedUtc / importedBy)
+    on the destination so a later refresh can tell what it already holds.
+
+    Read-side failures are raised as _PoolFileTooLarge (413),
+    ResourceNotFoundError (404) or _PoolReadError (502); upload failures
+    propagate unchanged (500) — the import route maps all four.
+    """
+    try:
+        data = pool_container.get_blob_client(pool_path).download_blob().readall()
+    except ResourceNotFoundError:
+        raise
+    except Exception as e:
+        raise _PoolReadError(f"could not read pool blob {pool_path}: {e}") from e
+
+    if len(data) > MAX_UPLOAD_SIZE:
+        raise _PoolFileTooLarge(pool_path)
+
+    container.upload_blob(blob_path, data, overwrite=True, metadata=metadata)
+
+
+def _refresh_from_pool(entity, container, folder_path):
+    """
+    Re-copy every file this competition already holds that is newer in the
+    platform file pool, and return the (sorted) names that were replaced.
+
+    The HOVTP listener overwrites pool blobs under the same stable filename on
+    every FS Manager re-export, and the UI hides pool files the tool already
+    holds — so without this the tool would keep generating from a stale copy.
+    Only names already held are refreshed: nothing is ever added or deleted.
+
+    Best effort by design: this runs on the read path (details + generate) and
+    must never break it, so every failure is logged and swallowed.
+    """
+    refreshed = []
+    try:
+        platform_id = (entity or {}).get("PlatformId")
+        if not platform_id or not _UUID_RE.fullmatch(str(platform_id)):
+            return []
+
+        try:
+            pool_container = get_platform_container_client()
+        except Exception as e:
+            logging.warning(f"Pool refresh: could not open the competition file pool: {e}")
+            return []
+        if pool_container is None:
+            return []
+
+        # What we hold today, and how fresh that copy is: the stamped pool
+        # timestamp when we imported it, else the blob's own last_modified.
+        own = {}
+        prefix = f"{folder_path}/"
+        for blob in container.list_blobs(name_starts_with=prefix, include=["metadata"]):
+            name = blob.name[len(prefix):]
+            if not name or '/' in name:
+                continue
+            if name in ("metadata.json", "init.md"):
+                continue
+            if not name.lower().endswith(".pdf"):
+                continue
+            recorded = _parse_iso_utc((blob.metadata or {}).get("poolUploadedUtc"))
+            if recorded is None:
+                recorded = _as_utc(blob.last_modified)
+            own[name] = recorded
+        if not own:
+            return []
+
+        # Newest pool candidate per name, across both pool folders.
+        candidates = {}
+        for source, folder in (("upload", "uploads"), ("fsm", "fsm")):
+            pool_prefix = f"{platform_id}/{folder}/"
+            try:
+                for blob in pool_container.list_blobs(name_starts_with=pool_prefix):
+                    name = blob.name[len(pool_prefix):]
+                    if not name or '/' in name or name not in own:
+                        continue
+                    modified = _as_utc(blob.last_modified)
+                    if modified is None:
+                        continue
+                    current = candidates.get(name)
+                    if current is None or modified > current[0]:
+                        candidates[name] = (modified, source, blob.name)
+            except Exception as e:
+                logging.warning(f"Pool refresh: could not list {pool_prefix}: {e}")
+
+        for name in sorted(candidates):
+            modified, source, pool_path = candidates[name]
+            recorded = own.get(name)
+            if recorded is not None and modified <= recorded:
+                continue
+            try:
+                _copy_pool_blob(pool_container, pool_path, container, f"{folder_path}/{name}", {
+                    "poolSource": source,
+                    "poolUploadedUtc": _iso_utc(modified),
+                    "importedBy": "pool-sync",
+                })
+                refreshed.append(name)
+            except _PoolFileTooLarge:
+                logging.warning(
+                    f"Pool refresh: {pool_path} exceeds the {MAX_UPLOAD_SIZE // (1024*1024)} MB limit, skipping")
+            except Exception as e:
+                logging.warning(f"Pool refresh: could not refresh {name} from {pool_path}: {e}")
+
+        if refreshed:
+            logging.info(
+                f"Pool refresh: replaced {len(refreshed)} file(s) in {folder_path} with newer pool copies")
+    except Exception as e:
+        logging.warning(f"Pool refresh failed for {folder_path}: {e}")
+
+    return sorted(refreshed)
+
+
 def get_table_client(table_name="generatedpapers"):
     """Helper to connect to Table Storage"""
     try:
@@ -276,6 +403,27 @@ def _parse_iso_utc(value):
     except Exception as e:
         logging.warning(f"Could not parse ISO timestamp '{value}': {e}")
         return None
+
+
+def _as_utc(dt):
+    """Normalize a datetime to an aware UTC one (None for anything else)."""
+    if not isinstance(dt, datetime):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _iso_utc(dt):
+    """
+    Format a datetime as the ISO-8601 UTC string this codebase stores
+    everywhere (naive UTC + 'Z', round-trips through `_parse_iso_utc`).
+    Returns "" for None/garbage — blob metadata values must be strings.
+    """
+    dt = _as_utc(dt)
+    if dt is None:
+        return ""
+    return dt.replace(tzinfo=None).isoformat() + "Z"
 
 
 def _ensure_deletion_date(comp_table, entity):
@@ -996,7 +1144,11 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             pass
 
-        blobs = container.list_blobs(name_starts_with=f"{folder_path}/")
+        # FS Manager re-exports overwrite the pool copy under the same name;
+        # pull any newer pool version in before listing what we hold.
+        refreshed = _refresh_from_pool(entity, container, folder_path)
+
+        blobs = container.list_blobs(name_starts_with=f"{folder_path}/", include=["metadata"])
         
         files_data = []
         structure = {} # { category: { segment: [files] } }
@@ -1024,6 +1176,9 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
                 
             parsed = parse_competition_file(blob.name, categories)
             if parsed:
+                # files_data, structure and competitionFiles share this dict.
+                parsed['lastModified'] = _iso_utc(blob.last_modified)
+                parsed['poolSource'] = (blob.metadata or {}).get('poolSource')
                 files_data.append(parsed)
                 cat = parsed['category']
                 seg = parsed['segment']
@@ -1163,7 +1318,8 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
                     structure["Uncategorized"]["Files"] = []
                 structure["Uncategorized"]["Files"].append({
                     "filename": blob.name.split('/')[-1],
-                    "suffix": blob.name.split('/')[-1]
+                    "suffix": blob.name.split('/')[-1],
+                    "lastModified": _iso_utc(blob.last_modified)
                 })
 
         # ---------------------------------------------------------
@@ -1275,6 +1431,8 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
             "alerts": alerts,
             "categories": list(detected_category_codes),
             "generatedFiles": generated_links,
+            # Names whose copy was just replaced by a newer one from the pool.
+            "refreshedFromPool": refreshed,
             # The site UI has no competition list anymore; retention (auto-delete
             # date + extend) is surfaced in the detail view instead.
             "deletionDate": entity.get("DeletionDate")
@@ -1389,6 +1547,9 @@ def generate_judging_papers(req: func.HttpRequest) -> func.HttpResponse:
         output_dir = os.path.join(temp_dir, "output")
         os.makedirs(source_dir)
         os.makedirs(output_dir)
+
+        # Generate from the current FSM export, not a stale copy.
+        _refresh_from_pool(entity, container_client, working_folder)
 
         # Download files
         logging.info(f"Downloading files from {working_folder}...")
@@ -1559,7 +1720,7 @@ def import_platform_file(req: func.HttpRequest) -> func.HttpResponse:
             status_code=409)
     # The binding originates from a client body (resolve_competition), so pin it
     # to a UUID before splicing it into the pool blob path.
-    if not re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", platform_id):
+    if not _UUID_RE.fullmatch(platform_id):
         logging.warning(f"Rejecting non-UUID PlatformId {platform_id!r} on competition {competition}")
         return func.HttpResponse(
             "not_bound: this competition's platform link is invalid",
@@ -1580,11 +1741,9 @@ def import_platform_file(req: func.HttpRequest) -> func.HttpResponse:
     pool_path = f"{platform_id}/{'fsm' if source == 'fsm' else 'uploads'}/{filename}"
 
     try:
-        source_blob = pool_container.get_blob_client(pool_path)
-        properties = source_blob.get_blob_properties()
+        properties = pool_container.get_blob_client(pool_path).get_blob_properties()
         if properties.size and properties.size > MAX_UPLOAD_SIZE:
             return func.HttpResponse(f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB.", status_code=413)
-        file_content = source_blob.download_blob().readall()
     except ResourceNotFoundError:
         return func.HttpResponse("File not found in the competition file pool", status_code=404)
     except Exception as e:
@@ -1592,9 +1751,6 @@ def import_platform_file(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             "platform_unavailable: could not read the competition file pool",
             status_code=502)
-
-    if len(file_content) > MAX_UPLOAD_SIZE:
-        return func.HttpResponse(f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB.", status_code=413)
 
     try:
         folder_path = entity.get("FolderPath", entity["RowKey"])
@@ -1605,9 +1761,34 @@ def import_platform_file(req: func.HttpRequest) -> func.HttpResponse:
         container = blob_service_client.get_container_client("fs-judgepapers")
 
         blob_path = f"{folder_path}/{filename}"
+    except Exception as e:
+        logging.error(f"Error importing file: {e}")
+        return func.HttpResponse("Internal server error", status_code=500)
 
-        container.upload_blob(blob_path, file_content, overwrite=True)
+    # Provenance: which pool folder the copy came from, how fresh the pool blob
+    # was, and who pulled it — `_refresh_from_pool` compares against this.
+    metadata = {
+        "poolSource": source,
+        "poolUploadedUtc": _iso_utc(getattr(properties, "last_modified", None)),
+        "importedBy": email,
+    }
 
+    try:
+        _copy_pool_blob(pool_container, pool_path, container, blob_path, metadata)
+    except _PoolFileTooLarge:
+        return func.HttpResponse(f"File too large. Maximum size is {MAX_UPLOAD_SIZE // (1024*1024)} MB.", status_code=413)
+    except ResourceNotFoundError:
+        return func.HttpResponse("File not found in the competition file pool", status_code=404)
+    except _PoolReadError as e:
+        logging.error(f"Error reading platform pool blob {pool_path}: {e}")
+        return func.HttpResponse(
+            "platform_unavailable: could not read the competition file pool",
+            status_code=502)
+    except Exception as e:
+        logging.error(f"Error importing file: {e}")
+        return func.HttpResponse("Internal server error", status_code=500)
+
+    try:
         _bump_competition_counters(competition, uploaded_delta=1)
 
         return func.HttpResponse(json.dumps({"filename": filename, "status": "uploaded"}), mimetype="application/json")
