@@ -269,7 +269,7 @@ def _refresh_from_pool(entity, container, folder_path):
                 continue
             if not name.lower().endswith(".pdf"):
                 continue
-            recorded = _parse_iso_utc((blob.metadata or {}).get("poolUploadedUtc"))
+            recorded = _parse_iso_utc(_meta(blob.metadata, "poolUploadedUtc"))
             if recorded is None:
                 recorded = _as_utc(blob.last_modified)
             own[name] = recorded
@@ -403,6 +403,17 @@ def _parse_iso_utc(value):
     except Exception as e:
         logging.warning(f"Could not parse ISO timestamp '{value}': {e}")
         return None
+
+
+def _meta(metadata, key):
+    """
+    Case-insensitive blob-metadata read: the keys travel as HTTP headers, so
+    Azure does not guarantee their case on the way back. None when absent.
+    """
+    for existing_key, value in (metadata or {}).items():
+        if existing_key.lower() == key.lower():
+            return value
+    return None
 
 
 def _as_utc(dt):
@@ -1177,8 +1188,12 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
             parsed = parse_competition_file(blob.name, categories)
             if parsed:
                 # files_data, structure and competitionFiles share this dict.
+                # lastModified = when this copy was written; uploadedUtc = when
+                # the file itself was uploaded / pushed by FSM (the pool time
+                # stamped at import, else the copy time for direct uploads).
                 parsed['lastModified'] = _iso_utc(blob.last_modified)
-                parsed['poolSource'] = (blob.metadata or {}).get('poolSource')
+                parsed['uploadedUtc'] = _meta(blob.metadata, 'poolUploadedUtc') or parsed['lastModified']
+                parsed['poolSource'] = _meta(blob.metadata, 'poolSource')
                 files_data.append(parsed)
                 cat = parsed['category']
                 seg = parsed['segment']
@@ -1319,7 +1334,8 @@ def get_competition_details(req: func.HttpRequest) -> func.HttpResponse:
                 structure["Uncategorized"]["Files"].append({
                     "filename": blob.name.split('/')[-1],
                     "suffix": blob.name.split('/')[-1],
-                    "lastModified": _iso_utc(blob.last_modified)
+                    "lastModified": _iso_utc(blob.last_modified),
+                    "uploadedUtc": _meta(blob.metadata, 'poolUploadedUtc') or _iso_utc(blob.last_modified)
                 })
 
         # ---------------------------------------------------------
